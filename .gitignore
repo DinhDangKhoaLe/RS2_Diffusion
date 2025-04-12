@@ -1,0 +1,6 @@
+*.ckpt
+*.mp4
+*.zip
+*.pyc
+*.pth
+/data
