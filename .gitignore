@@ -3,6 +3,6 @@
 *.zip
 *.pyc
 *.pth
-*.vs_code
+*.vscode
 /data
 /ckpt
