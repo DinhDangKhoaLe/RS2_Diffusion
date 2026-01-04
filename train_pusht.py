@@ -141,13 +141,11 @@ def main(dataset_path,checkpoint_dir):
     num_epochs = 200
 
     ema = EMAModel(
-        parameters=nets.parameters(),
+        parameters=nets['noise_pred_net'].parameters(),
         power=0.75)
 
-    # Standard ADAM optimizer
-    # Note that EMA parametesr are not optimized
     optimizer = torch.optim.AdamW(
-        params=nets.parameters(),
+        params=nets['noise_pred_net'].parameters(),
         lr=1e-4, weight_decay=1e-6)
 
     # Cosine LR schedule with linear warmup
@@ -218,7 +216,9 @@ def main(dataset_path,checkpoint_dir):
                     lr_scheduler.step()
 
                     # update Exponential Moving Average of the model weights
-                    ema.step(nets.parameters())
+                    # ema.step(nets.parameters())
+                    ema.step(nets['noise_pred_net'].parameters())
+
 
                     # logging
                     loss_cpu = loss.item()

@@ -349,6 +349,7 @@ class PushTEnv(gym.Env):
         return TeleopAgent(act)
 
     def _get_obs(self):
+        # img = self._render_frame(mode='human')
         obs = np.array(
             tuple(self.agent.position) \
             + tuple(self.block.position) \
@@ -377,7 +378,6 @@ class PushTEnv(gym.Env):
         return info
 
     def _render_frame(self, mode):
-
         if self.window is None and mode == "human":
             pygame.init()
             pygame.display.init()

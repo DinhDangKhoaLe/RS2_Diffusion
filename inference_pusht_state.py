@@ -9,8 +9,8 @@ from tqdm.auto import tqdm
 import os
 # env import
 from skvideo.io import vwrite
-from envir_pusht import PushTImageEnv
-from model import ConditionalUnet1D
+from envir_pusht import PushTEnv
+from model import FunctionalPolicy, LatentUnet1D, HyperNetwork
 from vision_encoder import get_resnet, replace_bn_with_gn
 from dataset_pusht import normalize_data, unnormalize_data
 import click
@@ -32,30 +32,44 @@ def main(checkpoint_path, num_videos, video_folder):
     obs_horizon = 2
     action_horizon = 8
     action_dim = 2
-    # ResNet18 has output dim of 512
-    vision_feature_dim = 512
-    # agent_pos is 2 dimensional
-    lowdim_obs_dim = 2
-    obs_dim = vision_feature_dim + lowdim_obs_dim
+    obs_dim = 5
+    latent_dim = 128
     
-    vision_encoder = get_resnet('resnet18')
-    vision_encoder = replace_bn_with_gn(vision_encoder)
-    # create network object
-    noise_pred_net = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=obs_dim*obs_horizon
-    )
-    # Create EMA models
-    ema_nets = nn.ModuleDict({
-    'vision_encoder': vision_encoder,
-    'noise_pred_net': noise_pred_net
-    })
-    # Move models to GPU
-    ema_nets = ema_nets.to(device)
-    # Load the checkpoint
+    policy_input_dim = obs_horizon * obs_dim
+    policy_output_dim = pred_horizon * action_dim
+    
+    # Define the shape of the weights our HyperNetwork generates
+    policy_shapes = {
+        'fc1.weight': (128, policy_input_dim),
+        'fc1.bias':   (128,),
+        'fc2.weight': (128, 128),
+        'fc2.bias':   (128,),
+        'fc3.weight': (policy_output_dim, 128),
+        'fc3.bias':   (policy_output_dim,)
+    }
+    
+    # --- 2. Initialize Models ---
+    # The Diffusion Model (Generates Latent Z)
+    noise_pred_net = LatentUnet1D(
+        latent_dim=latent_dim,
+        global_cond_dim=policy_input_dim,
+        down_dims=[64, 128, 256] 
+    ).to(device)
+    
+    # The HyperNetwork (Decodes Z -> Policy Weights)
+    hypernet = HyperNetwork(latent_dim, policy_shapes).to(device)
+    
+    # --- 3. Load Checkpoint ---
+    print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    ema_nets.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load state dicts
+    noise_pred_net.load_state_dict(checkpoint['diffusion_model'])
+    hypernet.load_state_dict(checkpoint['hypernet'])
     stats = checkpoint['stats']
+    
+    noise_pred_net.eval()
+    hypernet.eval()
     
     # for this demo, we use DDPMScheduler with 100 diffusion iterations
     num_diffusion_iters = 100
@@ -68,7 +82,7 @@ def main(checkpoint_path, num_videos, video_folder):
     
     # limit enviornment interaction to 200 steps before termination
     max_steps = 300
-    env = PushTImageEnv()
+    env = PushTEnv()
     # number of videos that reach the goal
     number_success_video = 0
     
@@ -94,43 +108,47 @@ def main(checkpoint_path, num_videos, video_folder):
             while not done:
                 B = 1
                 # stack the last obs_horizon number of observations
-                images = np.stack([x['image'] for x in obs_deque])
-                
-                agent_poses = np.stack([x['agent_pos'] for x in obs_deque])
-
+                obs_seq = np.stack(obs_deque)
                 # normalize observation
-                nagent_poses = normalize_data(agent_poses, stats=stats['agent_pos'])
-                nimages = images
+                nobs = normalize_data(obs_seq, stats=stats['obs'])
+                # Tensorize
+                nobs_tensor = torch.from_numpy(nobs).to(device, dtype=torch.float32)
+                # Flatten obs for condition: (1, obs_horizon * obs_dim)
+                obs_cond = nobs_tensor.unsqueeze(0).flatten(start_dim=1)
 
-                # device transfer
-                nimages = torch.from_numpy(nimages).to(device, dtype=torch.float32)
-                nagent_poses = torch.from_numpy(nagent_poses).to(device, dtype=torch.float32)
-
-                # infer action
-                with torch.no_grad():
-                    # nimages = nimages.clone().detach().to(device, dtype=torch.float32)
-                    image_features = ema_nets['vision_encoder'](nimages)
-                    obs_features = torch.cat([image_features, nagent_poses], dim=-1)
-                    obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)
-                    noisy_action = torch.randn((B, pred_horizon, action_dim), device=device)
-                    naction = noisy_action
+                with torch.no_grad():    
+                    # 1. Start with random noise for Latent Z
+                    latent_z = torch.randn((B, latent_dim), device=device)
                     noise_scheduler.set_timesteps(num_diffusion_iters)
+                    # 2. Denoise Z
 
                     for k in noise_scheduler.timesteps:
-                        noise_pred = ema_nets['noise_pred_net'](
-                            sample=naction,
+                        noise_pred = noise_pred_net(
+                            sample=latent_z,
                             timestep=k,
                             global_cond=obs_cond
                         )
-                        naction = noise_scheduler.step(
+                        latent_z = noise_scheduler.step(
                             model_output=noise_pred,
                             timestep=k,
-                            sample=naction
+                            sample=latent_z
                         ).prev_sample
+                    
+                    # 3. Decode Z -> Weights using HyperNetwork
+                    weights = hypernet(latent_z)
+                    # 4. Execute Functional Policy
+                    # This applies the generated weights to the observation
+                    naction_flat = FunctionalPolicy.apply(obs_cond, weights)
+                    
+                    # Reshape to (B, Horizon, Action_Dim)
+                    naction = naction_flat.reshape(B, pred_horizon, action_dim)
 
-                naction = naction.detach().to('cpu').numpy()
-                naction = naction[0]
+                # --- EXECUTION ---
+                # Unnormalize
+                naction = naction.detach().to('cpu').numpy()[0] # (Horizon, Action_Dim)
                 action_pred = unnormalize_data(naction, stats=stats['action'])
+                
+                # Receding Horizon Control
                 start = obs_horizon - 1
                 end = start + action_horizon
                 action = action_pred[start:end,:]
