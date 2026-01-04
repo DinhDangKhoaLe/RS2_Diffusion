@@ -494,7 +494,7 @@ class HyperNetwork(nn.Module):
         self.hnet = HMLP(
             target_shapes=self.shapes_list,
             cond_in_size=latent_dim,
-            layers=[100, 100],
+            layers=[200, 200],
             activation_fn=torch.nn.ReLU(),
             uncond_in_size=0,
             use_batch_norm=False

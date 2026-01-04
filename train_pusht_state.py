@@ -47,7 +47,7 @@ def main(dataset_path,checkpoint_dir):
     # create dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=256,
+        batch_size=64,
         num_workers=8,
         shuffle=True,
         # accelerate cpu-gpu transfer
@@ -68,7 +68,7 @@ def main(dataset_path,checkpoint_dir):
     
     obs_dim = 5
     action_dim = 2
-    latent_dim = 128  # Size of 'z'
+    latent_dim = 256  # Size of 'z'
     hidden_dim = 256 # 256 neurons per layer
 
     policy_input_dim = obs_horizon*obs_dim
@@ -96,7 +96,7 @@ def main(dataset_path,checkpoint_dir):
     noise_pred_net = LatentUnet1D(
         latent_dim=latent_dim,
         global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
-        down_dims=[64, 128, 256] # Smaller Unet for latent vector
+        down_dims=[256, 512, 1024] # Smaller Unet for latent vector
     ).to(device)
     
     # 3. HyperNetwork (Trainable): z -> Weights
@@ -112,22 +112,22 @@ def main(dataset_path,checkpoint_dir):
     
     
     # Training Config
-    phase1_epochs = 100  # Train Autoencoder
-    phase2_epochs = 300  # Train Diffusion
+    phase1_epochs = 300  # Train Autoencoder
+    phase2_epochs = 1000  # Train Diffusion
     
     # A small constant to prevent posterior collapse (where the encoder ignores the input).
-    kl_weight = 1e-4
+    kl_weight = 1e-8
     
     # ==========================================================================
     # PHASE 1: REPRESENTATION LEARNING (Autoencoder)
-    # Train Encoder + Hypernet to reconstruct actions. Ignore Diffusion.
+    # Train Encoder + Hypernet to reconstruct actions. Ignore Diffusion.s
     # ==========================================================================
     
     print(f"\n=== Starting Phase 1: Representation Learning ({phase1_epochs} Epochs) ===")
     
     optimizer_p1 = torch.optim.AdamW(
         list(encoder.parameters()) + list(hypernet.parameters()), 
-        lr=1e-4, weight_decay=1e-6
+        lr=3e-4, weight_decay=1e-6
     )
     
     lr_scheduler_p1 = get_scheduler(
