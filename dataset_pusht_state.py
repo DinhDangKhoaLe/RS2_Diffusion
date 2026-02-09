@@ -83,7 +83,8 @@ class PushTStateDataset(torch.utils.data.Dataset):
             # (N, action_dim)
             'action': dataset_root['data']['action'][:],
             # (N, obs_dim)
-            'obs': dataset_root['data']['state'][:]
+            'obs': dataset_root['data']['state'][:],
+            'state': dataset_root['data']['state'][:]
         }
         # Marks one-past the last index for each episode
         episode_ends = dataset_root['meta']['episode_ends'][:]

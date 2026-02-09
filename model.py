@@ -50,6 +50,7 @@ class Upsample1d(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+    
 
 
 class Conv1dBlock(nn.Module):
@@ -263,26 +264,11 @@ class ConditionalUnet1D(nn.Module):
 
 # --- A. Trajectory Encoder (Compresses Action Trajectory -> Latent Z) ---
 class TrajectoryEncoder(nn.Module):
-    # def __init__(self, action_dim, pred_horizon, latent_dim):
-    #     super().__init__()
-    #     input_dim = action_dim * pred_horizon
-    #     self.net = nn.Sequential(
-    #         nn.Linear(input_dim, 256),
-    #         nn.Mish(),
-    #         nn.Linear(256, 128),
-    #         nn.Mish(),
-    #         nn.Linear(128, latent_dim)
-    #     )
-    # def forward(self, actions):
-    #     # actions: (B, T, D)
-    #     B = actions.shape[0]
-    #     flat_actions = actions.reshape(B, -1)
-    #     return self.net(flat_actions)
-    
-    def __init__(self, action_dim, pred_horizon, latent_dim):
+    def __init__(self, state_dim, action_dim, pred_horizon, latent_dim):
         super().__init__()
+        # Calculate input dimension: (State + Action) * Time Steps
+        input_dim = (state_dim + action_dim) * pred_horizon
         # Simple MLP encoder architecture
-        input_dim = action_dim * pred_horizon
         self.net = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.ReLU(),
@@ -291,27 +277,279 @@ class TrajectoryEncoder(nn.Module):
             nn.Linear(512, 512),
             nn.ReLU(),
         )
+        
         # Two heads: one for Mean (mu), one for Log Variance (logvar)
         self.fc_mu = nn.Linear(512, latent_dim)
         self.fc_logvar = nn.Linear(512, latent_dim)
 
-    def forward(self, actions):
-        # actions: (B, T, D) -> (B, T*D)
-        B = actions.shape[0]
-        x = actions.reshape(B, -1)
+    def forward(self, states, actions):
+        """
+        Args:
+            states: Tensor of shape (B, T, state_dim)
+            actions: Tensor of shape (B, T, action_dim)
+        """
+        B = states.shape[0]
+        
+        # 1. Concatenate state and action along the feature dimension (dim=-1)
+        # Result shape: (B, T, state_dim + action_dim)
+        trajectory = torch.cat([states, actions], dim=-1)
+        
+        # 2. Flatten the time and feature dimensions
+        # Result shape: (B, T * (state_dim + action_dim))
+        x = trajectory.reshape(B, -1)
+        
         h = self.net(x)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
-        return mu, logvar
+        return mu, logvar   
 
     def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        else:
+            return mu
+        
+class ResnetBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels=None, time_emb_dim=None):
+        super().__init__()
+        self.out_channels = out_channels or in_channels
+        
+        self.norm1 = nn.GroupNorm(8, in_channels)
+        self.conv1 = nn.Conv1d(in_channels, self.out_channels, 3, padding=1)
+        
+        if time_emb_dim is not None:
+            self.time_emb_proj = nn.Linear(time_emb_dim, self.out_channels)
+            
+        self.norm2 = nn.GroupNorm(8, self.out_channels)
+        self.conv2 = nn.Conv1d(self.out_channels, self.out_channels, 3, padding=1)
+        
+        if in_channels != self.out_channels:
+            self.shortcut = nn.Conv1d(in_channels, self.out_channels, 1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x, time_emb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        
+        if time_emb is not None:
+            # Project time_emb and broadcast over sequence length
+            t_emb = self.time_emb_proj(F.silu(time_emb))
+            h = h + t_emb[:, :, None]
+            
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.shortcut(x)
+
+class TransformerBlock1D(nn.Module):
+    """
+    A Transformer block for 1D sequences with Cross-Attention.
+    Correctly handles cases where cond_dim != model_channels.
+    """
+    def __init__(self, dim, n_heads, cond_dim, depth=1):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                # 1. Self-Attention (Processing the Latent)
+                # Inputs: x, x, x (All have dimension 'dim')
+                nn.LayerNorm(dim),
+                nn.MultiheadAttention(embed_dim=dim, num_heads=n_heads, batch_first=True),
+                
+                # 2. Cross-Attention (Injecting the Condition)
+                # Query: x (dimension 'dim')
+                # Key/Value: context (dimension 'cond_dim')
+                # We must specify kdim and vdim!
+                nn.LayerNorm(dim),
+                nn.MultiheadAttention(
+                    embed_dim=dim, 
+                    num_heads=n_heads, 
+                    batch_first=True,
+                    kdim=cond_dim,   # <--- FIX: Tell layer Key dim is cond_dim
+                    vdim=cond_dim    # <--- FIX: Tell layer Value dim is cond_dim
+                ),
+                
+                # 3. Feed Forward
+                nn.LayerNorm(dim),
+                nn.Sequential(
+                    nn.Linear(dim, dim * 4),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim)
+                )
+            ]))
+
+    def forward(self, x, context):
+        b, c, t = x.shape
+        x_in = x.permute(0, 2, 1) # (B, T, C)
+        
+        # Ensure context has a sequence dimension for attention
+        if context.ndim == 2:
+            context = context.unsqueeze(1) # (B, 1, cond_dim)
+
+        for ln_1, self_attn, ln_2, cross_attn, ln_3, ff in self.layers:
+            # 1. Self Attention
+            norm_x = ln_1(x_in)
+            attn_out, _ = self_attn(norm_x, norm_x, norm_x)
+            x_in = x_in + attn_out
+            
+            # 2. Cross Attention
+            norm_x = ln_2(x_in)
+            # Query=norm_x (dim=32), Key/Val=context (dim=10)
+            # The layer now handles the projection from 10 -> 32 internally
+            attn_out, _ = cross_attn(norm_x, context, context)
+            x_in = x_in + attn_out
+            
+            # 3. Feed Forward
+            out = ff(ln_3(x_in))
+            x_in = x_in + out
+            
+        return x_in.permute(0, 2, 1)
+
+class LatentDiffusionUNet(nn.Module):
+    def __init__(self,
+        input_dim,          # Dimension of the latent vector 'z' (e.g., 256)
+        cond_dim=4,         # "Conditioning Dimension 4"
+        model_channels=32,  # "Channels 32"
+        channel_mults=(1, 2, 4), # "Channel Multipliers {1, 2, 4}"
+        attn_levels=(0, 1), # "Attention Levels {0, 1}"
+        n_res_blocks=1,     # "Number of Residual Blocks 1"
+        n_heads=2,          # "Number of Heads 2"
+        tf_layers=1,        # "Transformer Layers 1"
+    ):
+        super().__init__()
+        
+        # 1. Input Processing
+        # We treat the input latent vector (B, input_dim) as a sequence (B, 1, input_dim)
+        # or (B, input_dim, 1). To use 1D Conv properly, we map:
+        # Input: (B, input_dim) -> Treat as (B, 1, input_dim) sequence
+        # Channels = 1 (feature channel), Length = input_dim.
+        
+        self.input_dim = input_dim
+        self.model_channels = model_channels
+        
+        # Time Embeddings
+        time_embed_dim = model_channels * 4
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(model_channels),
+            nn.Linear(model_channels, time_embed_dim),
+            nn.GELU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        # Initial Conv
+        self.input_conv = nn.Conv1d(1, model_channels, 3, padding=1)
+
+        # Downsampling Stack
+        self.down_blocks = nn.ModuleList([])
+        ch = model_channels
+        dims = [model_channels]
+        
+        curr_res = 1 # We track "resolution" logic as levels
+        
+        for i, mult in enumerate(channel_mults):
+            out_ch = model_channels * mult
+            for _ in range(n_res_blocks):
+                layers = [ResnetBlock1D(ch, out_ch, time_embed_dim)]
+                ch = out_ch
+                
+                # Check if we add Attention at this level
+                if i in attn_levels:
+                    layers.append(TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers))
+                
+                self.down_blocks.append(nn.ModuleList(layers))
+                dims.append(ch)
+            
+            # Downsample (except last level)
+            if i != len(channel_mults) - 1:
+                self.down_blocks.append(nn.ModuleList([Downsample1d(ch)]))
+                dims.append(ch)
+
+        # Middle Block
+        self.mid_block1 = ResnetBlock1D(ch, ch, time_embed_dim)
+        self.mid_attn = TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers)
+        self.mid_block2 = ResnetBlock1D(ch, ch, time_embed_dim)
+
+        # Upsampling Stack
+        self.up_blocks = nn.ModuleList([])
+        
+        # Reverse the multipliers for upsampling
+        for i, mult in enumerate(reversed(channel_mults)):
+            out_ch = model_channels * mult
+            # Map the reversed index i back to the original level index for attention check
+            original_level_idx = len(channel_mults) - 1 - i
+            
+            for _ in range(n_res_blocks + 1): # +1 for the skip connection
+                layers = [ResnetBlock1D(ch + dims.pop(), out_ch, time_embed_dim)]
+                ch = out_ch
+                
+                if original_level_idx in attn_levels:
+                    layers.append(TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers))
+                
+                self.up_blocks.append(nn.ModuleList(layers))
+            
+            if original_level_idx != 0:
+                self.up_blocks.append(Upsample1d(ch))
+
+        # Final Output
+        self.out_norm = nn.GroupNorm(8, ch)
+        self.out_conv = nn.Conv1d(ch, 1, 3, padding=1)
+
+    def forward(self, x, timesteps, context):
         """
-        The "Reparameterization Trick":
-        z = mu + sigma * epsilon
+        x: (B, input_dim) -> Noisy Latent
+        timesteps: (B,) -> Noise levels
+        context: (B, cond_dim) -> Conditioning vector
         """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        # Shape Handling: (B, D) -> (B, 1, D)
+        # 1 Channel, Length = D
+        x = x.unsqueeze(1) 
+        
+        t = self.time_mlp(timesteps)
+        
+        h = self.input_conv(x)
+        hs = [h]
+        
+        # --- Down ---
+        for module in self.down_blocks:
+            if isinstance(module, nn.ModuleList): # ResNet + Attn
+                for layer in module:
+                    if isinstance(layer, ResnetBlock1D):
+                        h = layer(h, t)
+                    elif isinstance(layer, TransformerBlock1D):
+                        h = layer(h, context)
+                hs.append(h)
+            else: # Downsample
+                h = module(h)
+                hs.append(h)
+
+        # --- Mid ---
+        h = self.mid_block1(h, t)
+        h = self.mid_attn(h, context)
+        h = self.mid_block2(h, t)
+
+        # --- Up ---
+        for module in self.up_blocks:
+            if isinstance(module, nn.ModuleList): # ResNet + Attn
+                # Concatenate Skip Connection
+                h_skip = hs.pop()
+                # Ensure shapes match (handle potential odd/even rounding issues if input_dim is weird)
+                if h.shape[-1] != h_skip.shape[-1]:
+                    h = F.interpolate(h, size=h_skip.shape[-1], mode='nearest')
+                    
+                h = torch.cat((h, h_skip), dim=1)
+                
+                for layer in module:
+                    if isinstance(layer, ResnetBlock1D):
+                        h = layer(h, t)
+                    elif isinstance(layer, TransformerBlock1D):
+                        h = layer(h, context)
+            else: # Upsample
+                h = module(h)
+
+        h = self.out_conv(F.silu(self.out_norm(h)))
+        
+        # Shape Back: (B, 1, D) -> (B, D)
+        return h.squeeze(1)
  
 class LatentUnet1D(nn.Module):
     """
@@ -434,110 +672,76 @@ class LatentUnet1D(nn.Module):
         x = x.squeeze(1)
         return x
 
-# class HyperNetwork(nn.Module):
-#     """
-#     Decodes the Latent 'z' into the weights of the Policy Network.
-#     """
-#     def __init__(self, latent_dim, param_shapes):
-#         super().__init__()
-#         self.latent_dim = latent_dim
-#         self.param_shapes = param_shapes
-        
-#         # Calculate total number of parameters to generate
-#         self.total_params = 0
-#         for shape in param_shapes.values():
-#             prod = 1
-#             for dim in shape: prod *= dim
-#             self.total_params += prod
-            
-#         # A simple MLP decoder
-#         self.decoder = nn.Sequential(
-#             nn.Linear(latent_dim, 512),
-#             nn.Mish(),
-#             nn.Linear(512, 1024),
-#             nn.Mish(),
-#             nn.Linear(1024, self.total_params)
-#         )
-
-#     def forward(self, z):
-#         # z: (B, latent_dim)
-#         flat_params = self.decoder(z)
-        
-#         # Reshape flat params into dictionary of weights
-#         params_dict = {}
-#         curr_idx = 0
-#         for name, shape in self.param_shapes.items():
-#             num_p = 1
-#             for dim in shape: num_p *= dim
-            
-#             p = flat_params[:, curr_idx : curr_idx + num_p]
-#             params_dict[name] = p.view(-1, *shape)
-#             curr_idx += num_p
-            
-#         return params_dict
-    
 # --- C. HMLP Wrapper for HypnetTorch ---
+
 class HyperNetwork(nn.Module):
-    """
-    Wraps hypnettorch.hnets.HMLP.
-    Conditions on 'z' (latent_dim=256) to generate policy weights.
-    Structure: [100, 100] hidden layers.
-    """
     def __init__(self, latent_dim, param_shapes):
         super().__init__()
         self.param_shapes = param_shapes
-        # Convert dictionary shapes to list of shapes for HMLP
-        self.shapes_list = list(param_shapes.values())
         self.keys_list = list(param_shapes.keys())
+        self.shapes_list = list(param_shapes.values())
         
         # Initialize HMLP
         self.hnet = HMLP(
             target_shapes=self.shapes_list,
             cond_in_size=latent_dim,
-            layers=[200, 200],
-            activation_fn=torch.nn.ReLU(),
-            uncond_in_size=0,
-            use_batch_norm=False
+            layers=(400, 400),      
         )
 
     def forward(self, z):
-        # z: (B, latent_dim)
-        
-        # HMLP forward returns: [ [p1_s1, p2_s1...], [p1_s2, p2_s2...], ... ]
-        # Inner lists are parameters for a single sample.
-        # Outer list is the batch.
-        params_per_sample = self.hnet.forward(cond_input=z)
-        
-        # We need to Transpose this to: [ [p1_s1, p1_s2...], [p2_s1, p2_s2...], ... ]
-        # zip(*list) is the standard python idiom for transposing lists of lists.
-        params_per_layer = list(zip(*params_per_sample))
-        
-        params_dict = {}
-        for i, key in enumerate(self.keys_list):
-            # params_per_layer[i] is now a tuple of tensors for this specific weight across the batch
-            # Stack them to get (Batch, ...)
-            params_dict[key] = torch.stack(params_per_layer[i], dim=0)
-            
-        return params_dict
+        """
+        Args:
+            z: (B, latent_dim)
+        Returns:
+            params_dict: dict[str, Tensor] with shape (B, *param_shape)
+        """
+        params = self.hnet(cond_input=z)
+
+        # Normalize to batch-first list
+        if isinstance(params[0], torch.Tensor):
+            params = [params]  # B = 1
+
+        # params: List[B] of List[num_params]
+        params = list(zip(*params))  # param-first
+
+        return {
+            key: torch.stack(p, dim=0)
+            for key, p in zip(self.keys_list, params)
+        }
 
 class FunctionalPolicy:
     @staticmethod
     def apply(obs, params_dict):
+        # Handle both (B, Dim) and (B, T, Dim)
+        if obs.dim() == 3:
+            # Trajectory Mode: (Batch, Time, Dim)
+            einsum_str = 'bti,boi->bto'
+            # We must unsqueeze bias to (B, 1, Out) to broadcast over Time
+            bias_op = lambda b: b.unsqueeze(1)
+        else:
+            # Single Step Mode: (Batch, Dim)
+            einsum_str = 'bi,boi->bo'
+            # No change needed for bias
+            bias_op = lambda b: b
+
+        x = obs
+        
         # Layer 1
         w1 = params_dict['fc1.weight'] 
         b1 = params_dict['fc1.bias']   
-        x = torch.einsum('bi,boi->bo', obs, w1) + b1
-        x = F.mish(x) # Or F.relu
+        # Apply bias_op(b1) to handle the broadcasting
+        x = torch.einsum(einsum_str, x, w1) + bias_op(b1)
+        x = F.relu(x)
         
         # Layer 2
         w2 = params_dict['fc2.weight'] 
         b2 = params_dict['fc2.bias']   
-        x = torch.einsum('bi,boi->bo', x, w2) + b2
-        x = F.mish(x)
+        x = torch.einsum(einsum_str, x, w2) + bias_op(b2)
+        x = F.relu(x)
         
-        # Layer 3 (Output)
+        # Layer 3
         w3 = params_dict['fc3.weight']
         b3 = params_dict['fc3.bias']
-        x = torch.einsum('bi,boi->bo', x, w3) + b3
+        x = torch.einsum(einsum_str, x, w3) + bias_op(b3)
         
         return x
