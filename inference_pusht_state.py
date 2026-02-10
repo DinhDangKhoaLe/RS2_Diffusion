@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -68,7 +69,7 @@ def main(checkpoint_path, num_videos, video_folder):
     
     # --- 3. Load Checkpoint ---
     print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     noise_pred_net.load_state_dict(checkpoint['diffusion_model'])
     hypernet.load_state_dict(checkpoint['hypernet'])
@@ -124,17 +125,21 @@ def main(checkpoint_path, num_videos, video_folder):
                 # 2. Diffusion Denoising
                 noise_scheduler.set_timesteps(num_diffusion_iters)
                 for k in noise_scheduler.timesteps:
-                    print("noisy_z.shape:", latent_z.shape)
-                    print("timesteps.shape:", k.shape)
-                    print("obs_cond.shape:", obs_cond.shape)
+                    # Model needs batched, CUDA, float timesteps
+                    t_model = k.expand(latent_z.shape[0]).to(device).float()
+
+                    # Scheduler needs scalar timestep (CPU is fine)
+                    t_sched = k
+
                     noise_pred = noise_pred_net(
                         x=latent_z,
-                        timesteps=k,
+                        timesteps=t_model,
                         context=obs_cond
                     )
+
                     latent_z = noise_scheduler.step(
                         model_output=noise_pred,
-                        timestep=k,
+                        timestep=t_sched,
                         sample=latent_z
                     ).prev_sample
                 

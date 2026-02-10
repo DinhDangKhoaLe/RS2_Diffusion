@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
+
 from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
 import click
@@ -97,9 +98,9 @@ def main(dataset_path,checkpoint_dir):
     #     global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
     # ).to(device)
 
-    noise_pred_net = LatentDiffusionUNet(
-        input_dim=latent_dim,
-        cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    noise_pred_net = LatentUnet1D(
+        latent_dim=latent_dim,
+        global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
     ).to(device)
     
     # 3. HyperNetwork (Trainable): z -> Weights
@@ -213,7 +214,9 @@ def main(dataset_path,checkpoint_dir):
     optimizer_p2 = torch.optim.AdamW(noise_pred_net.parameters(), lr=3e-4, weight_decay=1e-6)
     
     # Initialize EMA (Exponential Moving Average) for stable sampling
-    ema = EMAModel(parameters=noise_pred_net.parameters(), power=0.75)
+    # ema = EMAModel(parameters=noise_pred_net.parameters(), power=0.75)
+    ema = EMAModel(noise_pred_net, power=0.75)
+
     
     # Cosine Scheduler
     lr_scheduler_p2 = get_scheduler(
@@ -268,7 +271,7 @@ def main(dataset_path,checkpoint_dir):
                 lr_scheduler_p2.step()
                 
                 # Update EMA model
-                ema.step(noise_pred_net.parameters())
+                ema.step(noise_pred_net)
                 
                 epoch_loss.append(loss.item())
 
@@ -277,22 +280,27 @@ def main(dataset_path,checkpoint_dir):
             tglobal.set_postfix(diff_loss=avg_loss)
 
             # Save Phase 2 Checkpoint
-            if (epoch_idx + 1) % 50 == 0:
-                # 1. Create a copy of the model with EMA weights applied
-                # We don't want to overwrite the training model, so we copy the weights temporarily
-                ema.store(noise_pred_net.parameters()) # Save original weights
-                ema.copy_to(noise_pred_net.parameters()) # Load EMA weights into model
+            if (epoch_idx + 1) % 100 == 0:
+                # # 1. Create a copy of the model with EMA weights applied
+                # # We don't want to overwrite the training model, so we copy the weights temporarily
+                # # ema.store(noise_pred_net.parameters()) # Save original weights
+                # ema.store(noise_pred_net)           # Save original weights
+
+                # # ema.copy_to(noise_pred_net.parameters()) # Load EMA weights into model
+                # ema.copy_to(noise_pred_net)         # Load EMA weights
+
+                # # Get the state_dict of the EMA-averaged model
+                # ema_model_state_dict = noise_pred_net.state_dict()
                 
-                # Get the state_dict of the EMA-averaged model
-                ema_model_state_dict = noise_pred_net.state_dict()
-                
-                # Restore original weights to continue training correctly
-                ema.restore(noise_pred_net.parameters())
+                # # Restore original weights to continue training correctly
+                # # ema.restore(noise_pred_net.parameters())
+                # ema.restore(noise_pred_net)         # Restore original weights
+
 
                 torch.save({
                     'epoch': epoch_idx + 1,
                     'diffusion_model': noise_pred_net.state_dict(), # The current training weights
-                    'ema_model': ema_model_state_dict,              # The smoothed EMA weights
+                    # 'ema_model': ema.model.state_dict(),              # The smoothed EMA weights
                     'encoder': encoder.state_dict(),
                     'hypernet': hypernet.state_dict(),
                     'stats': dataset.stats
