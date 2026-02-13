@@ -263,53 +263,194 @@ class ConditionalUnet1D(nn.Module):
         return x
 
 # --- A. Trajectory Encoder (Compresses Action Trajectory -> Latent Z) ---
-class TrajectoryEncoder(nn.Module):
-    def __init__(self, state_dim, action_dim, pred_horizon, latent_dim):
+# class TrajectoryEncoder(nn.Module):
+#     def __init__(self, state_dim, action_dim, pred_horizon, latent_dim):
+#         super().__init__()
+#         # Calculate input dimension: (State + Action) * Time Steps
+#         input_dim = (state_dim + action_dim) * pred_horizon
+#         # Simple MLP encoder architecture
+#         self.net = nn.Sequential(
+#             nn.Linear(input_dim, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#         )
+        
+#         # Two heads: one for Mean (mu), one for Log Variance (logvar)
+#         self.fc_mu = nn.Linear(512, latent_dim)
+#         self.fc_logvar = nn.Linear(512, latent_dim)
+
+#     def forward(self, states, actions):
+#         """
+#         Args:
+#             states: Tensor of shape (B, T, state_dim)
+#             actions: Tensor of shape (B, T, action_dim)
+#         """
+#         B = states.shape[0]
+        
+#         # 1. Concatenate state and action along the feature dimension (dim=-1)
+#         # Result shape: (B, T, state_dim + action_dim)
+#         trajectory = torch.cat([states, actions], dim=-1)
+        
+#         # 2. Flatten the time and feature dimensions
+#         # Result shape: (B, T * (state_dim + action_dim))
+#         x = trajectory.reshape(B, -1)
+        
+#         h = self.net(x)
+#         mu = self.fc_mu(h)
+#         logvar = self.fc_logvar(h)
+#         return mu, logvar   
+
+#     def reparameterize(self, mu, logvar):
+#         if self.training:
+#             std = torch.exp(0.5 * logvar)
+#             eps = torch.randn_like(std)
+#             return mu + eps * std
+#         else:
+#             return mu
+        
+# -------------------------------------------------
+# Basic TCN Block (Causal, Dilated, Residual)
+# -------------------------------------------------
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
         super().__init__()
-        # Calculate input dimension: (State + Action) * Time Steps
-        input_dim = (state_dim + action_dim) * pred_horizon
-        # Simple MLP encoder architecture
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size,
+            padding=padding,
+            dilation=dilation,
+        )
+
+        self.downsample = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else None
+        )
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = out[:, :, : x.size(2)]  # remove future padding (causal)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = out[:, :, : x.size(2)]
+        out = self.relu(out)
+
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+# -------------------------------------------------
+# TCN Encoder (stacked dilated blocks)
+# -------------------------------------------------
+class TCNEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=4, kernel_size=3):
+        super().__init__()
+
+        layers = []
+        for i in range(num_layers):
+            dilation = 2 ** i
+            in_ch = input_dim if i == 0 else hidden_dim
+            layers.append(
+                TemporalBlock(
+                    in_ch,
+                    hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                )
+            )
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        """
+        x = x.transpose(1, 2)  # -> (B, D, T)
+        out = self.network(x)  # -> (B, hidden_dim, T)
+
+        # take last time step (causal summary)
+        return out[:, :, -1]   # -> (B, hidden_dim)
+        
+
+# -------------------------------------------------
+# Trajectory Encoder with Separate State/Action TCNs
+# -------------------------------------------------
+class TrajectoryEncoder(nn.Module):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        pred_horizon,
+        latent_dim,
+        tcn_hidden=256,
+        tcn_layers=4,
+    ):
+        super().__init__()
+
+        # Separate temporal encoders
+        self.state_tcn = TCNEncoder(
+            input_dim=state_dim,
+            hidden_dim=tcn_hidden,
+            num_layers=tcn_layers,
+        )
+
+        self.action_tcn = TCNEncoder(
+            input_dim=action_dim,
+            hidden_dim=tcn_hidden,
+            num_layers=tcn_layers,
+        )
+
+        # Fusion MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * tcn_hidden, 512),
             nn.ReLU(),
             nn.Linear(512, 512),
             nn.ReLU(),
         )
-        
-        # Two heads: one for Mean (mu), one for Log Variance (logvar)
+
         self.fc_mu = nn.Linear(512, latent_dim)
         self.fc_logvar = nn.Linear(512, latent_dim)
 
     def forward(self, states, actions):
         """
-        Args:
-            states: Tensor of shape (B, T, state_dim)
-            actions: Tensor of shape (B, T, action_dim)
+        states:  (B, T, state_dim)
+        actions: (B, T, action_dim)
         """
-        B = states.shape[0]
-        
-        # 1. Concatenate state and action along the feature dimension (dim=-1)
-        # Result shape: (B, T, state_dim + action_dim)
-        trajectory = torch.cat([states, actions], dim=-1)
-        
-        # 2. Flatten the time and feature dimensions
-        # Result shape: (B, T * (state_dim + action_dim))
-        x = trajectory.reshape(B, -1)
-        
-        h = self.net(x)
+
+        state_embed = self.state_tcn(states)     # (B, H)
+        action_embed = self.action_tcn(actions)  # (B, H)
+
+        fused = torch.cat([state_embed, action_embed], dim=-1)
+        h = self.mlp(fused)
+
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
-        return mu, logvar   
+
+        return mu, logvar
 
     def reparameterize(self, mu, logvar):
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + eps * std
-        else:
-            return mu
+        return mu
+
         
 class ResnetBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels=None, time_emb_dim=None):

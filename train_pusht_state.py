@@ -59,7 +59,7 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     # create dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=512,
+        batch_size=128,
         num_workers=8,
         shuffle=True,
         # accelerate cpu-gpu transfer
@@ -102,20 +102,11 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     encoder = TrajectoryEncoder(state_dim, action_dim, pred_horizon, latent_dim).to(device)
     
     # 2. Diffusion Model (Trainable): Noisy z -> Noise
-    # noise_pred_net = LatentDiffusionUNet(
-    #     latent_dim=latent_dim,
-    #     global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
-    # ).to(device)
-
-    noise_pred_net = LatentUnet1D(
-        latent_dim=latent_dim,
+    
+    noise_pred_net = ConditionalUnet1D(
+        input_dim=1,
         global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
     ).to(device)
-    
-    # noise_pred_net = ConditionalUnet1D(
-    #     input_dim=latent_dim,
-    #     global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
-    # ).to(device)
     
     # 3. HyperNetwork (Trainable): z -> Weights
     hypernet = HyperNetwork(latent_dim, policy_shapes).to(device)
@@ -276,6 +267,7 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                     # CRITICAL UPDATE: Pass both State and Action to encoder
                     mu, logvar = encoder(nstate, naction)
                     z_gt = encoder.reparameterize(mu, logvar)
+                    z_gt = z_gt.unsqueeze(-1)
                     
                 # --- 2. Diffusion Forward Process ---
                 # Sample noise to add to the latent
