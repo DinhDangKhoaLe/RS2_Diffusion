@@ -708,6 +708,23 @@ class HyperNetwork(nn.Module):
             key: torch.stack(p, dim=0)
             for key, p in zip(self.keys_list, params)
         }
+        
+    # def forward(self, z):
+    #     """
+    #     Args:
+    #         z: (B, latent_dim)
+    #     Returns:
+    #         params_dict: dict of tensors with shape (B, *param_shape)
+    #     """
+    #     # HMLP returns a list of tensors: [tensor(B, shape1), tensor(B, shape2), ...]
+    #     params = self.hnet(cond_input=z)
+        
+    #     # Ensure params is a list of tensors, not a list of lists
+    #     # If HMLP returns a list of lists, this dictionary comprehension 
+    #     # should be optimized using torch.cat or similar batch operations.
+    #     return {
+    #         key: p for key, p in zip(self.keys_list, params)
+    #     }
 
 class FunctionalPolicy:
     @staticmethod
@@ -744,4 +761,5 @@ class FunctionalPolicy:
         b3 = params_dict['fc3.bias']
         x = torch.einsum(einsum_str, x, w3) + bias_op(b3)
         
+        # return torch.tanh(x)
         return x

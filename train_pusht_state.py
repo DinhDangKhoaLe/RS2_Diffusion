@@ -6,25 +6,36 @@ import torch.nn.functional as F
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
-
 from diffusers.optimization import get_scheduler
+
 from tqdm.auto import tqdm
 import click
 
-from model import ConditionalUnet1D, FunctionalPolicy, TrajectoryEncoder, LatentUnet1D, HyperNetwork, LatentDiffusionUNet
+from model import (
+ConditionalUnet1D,
+FunctionalPolicy,
+TrajectoryEncoder,
+LatentUnet1D,
+HyperNetwork,
+LatentDiffusionUNet
+)
 from dataset_pusht_state import PushTStateDataset
 from vision_encoder import get_resnet, replace_bn_with_gn
 
 @click.command()
 @click.option('-i', '--dataset_path', required=True)
 @click.option('-o', '--checkpoint_dir', default='ckpt', help='Directory to save checkpoints')
-def main(dataset_path,checkpoint_dir):
+@click.option('--phase1_ckpt', default=None, help='Path to pretrained Phase 1 checkpoint')
+
+def main(dataset_path,checkpoint_dir, phase1_ckpt):
     # Ensure checkpoint directory exists
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     # Ensure dataset path exists
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # parameters
     pred_horizon = 16
@@ -48,13 +59,13 @@ def main(dataset_path,checkpoint_dir):
     # create dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=128,
+        batch_size=512,
         num_workers=8,
         shuffle=True,
         # accelerate cpu-gpu transfer
         pin_memory=True,
         # don't kill worker process afte each epoch
-        persistent_workers=True
+        persistent_workers=False
     )
     
     # visualize data in batch
@@ -86,14 +97,12 @@ def main(dataset_path,checkpoint_dir):
         'fc3.bias':   (action_dim,)
     }
     
-    # --- Initialize Networks ---
-    device = torch.device('cuda')
     
     # 1. Encoder (Trainable): Action -> z
     encoder = TrajectoryEncoder(state_dim, action_dim, pred_horizon, latent_dim).to(device)
     
     # 2. Diffusion Model (Trainable): Noisy z -> Noise
-    # noise_pred_net = LatentUnet1D(
+    # noise_pred_net = LatentDiffusionUNet(
     #     latent_dim=latent_dim,
     #     global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
     # ).to(device)
@@ -102,6 +111,11 @@ def main(dataset_path,checkpoint_dir):
         latent_dim=latent_dim,
         global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
     ).to(device)
+    
+    # noise_pred_net = ConditionalUnet1D(
+    #     input_dim=latent_dim,
+    #     global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    # ).to(device)
     
     # 3. HyperNetwork (Trainable): z -> Weights
     hypernet = HyperNetwork(latent_dim, policy_shapes).to(device)
@@ -116,81 +130,98 @@ def main(dataset_path,checkpoint_dir):
     
     
     # Training Config
-    phase1_epochs = 1  # Train Autoencoder
-    phase2_epochs = 500  # Train Diffusion
-    
-    # A small constant to prevent posterior collapse (where the encoder ignores the input).
+    phase1_epochs = 1000  # Train Autoencoder
+    phase2_epochs = 1000  # Train Diffusion
     kl_weight = 1e-10
     
-    # ==========================================================================
+    # ==================================================================
     # PHASE 1: REPRESENTATION LEARNING (Autoencoder)
     # Train Encoder + Hypernet to reconstruct actions. Ignore Diffusion.s
+    # ==================================================================
+    if phase1_ckpt is not None:
+
+        print(f"\n=== Loading Phase 1 checkpoint from {phase1_ckpt} ===")
+
+        if not os.path.exists(phase1_ckpt):
+            raise FileNotFoundError(f"{phase1_ckpt} not found.")
+
+        ckpt = torch.load(phase1_ckpt, map_location=device)
+
+        encoder.load_state_dict(ckpt['encoder'])
+        hypernet.load_state_dict(ckpt['hypernet'])
+
+        print("Phase 1 weights loaded successfully. Skipping training.")
+
+    else:
+
+        print(f"\n=== Starting Phase 1 Training ({phase1_epochs} Epochs) ===")
+
+        optimizer_p1 = torch.optim.AdamW(
+            list(encoder.parameters()) + list(hypernet.parameters()),
+            lr=3e-4,
+            weight_decay=1e-6
+        )
+
+        lr_scheduler_p1 = get_scheduler(
+            'cosine',
+            optimizer=optimizer_p1,
+            num_warmup_steps=500,
+            num_training_steps=len(dataloader) * phase1_epochs
+        )
+    
+        with tqdm(range(phase1_epochs), desc='Phase 1 Epoch') as tglobal:
+            for epoch_idx in tglobal:
+                epoch_loss = []
+                for nbatch in tqdm(dataloader, desc='Batch', leave=False):
+                    # Data
+                    nstate = nbatch['state'].to(device)
+                    naction = nbatch['action'].to(device)
+                    B, _, _ = nstate.shape
+
+                    # Forward
+                    # 1. Variational Encoding
+                    mu, logvar = encoder(nstate, naction)
+                    
+                    # 2. Reparameterize (Sample z)
+                    z = encoder.reparameterize(mu, logvar)
+                    
+                    # 3. Decode (Hypernet -> Policy -> Action)
+                    weights = hypernet(z)
+                    pred_action = FunctionalPolicy.apply(nstate, weights)
+
+                    # --- ELBO LOSS CALCULATION ---
+                    # A. Reconstruction Loss (Likelihood)
+                    # recon_loss = F.mse_loss(pred_action, naction)
+                    recon_loss = F.mse_loss(pred_action, naction, reduction='sum') / B
+
+                    # B. KL Divergence Loss
+                    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                    kl_loss = kl_loss / B
+
+                    # Total Loss (Negative ELBO)
+                    loss = recon_loss + (kl_weight * kl_loss)
+
+                    # --- Optimization ---
+                    optimizer_p1.zero_grad()
+                    loss.backward()
+                    optimizer_p1.step()
+                    lr_scheduler_p1.step()
+
+                    epoch_loss.append(loss.item())
+                
+                avg_loss = np.mean(epoch_loss)
+                tglobal.set_postfix(recon_loss=avg_loss)
+                
+                # Save Phase 1 Checkpoint
+                if (epoch_idx + 1) % 100 == 0:
+                    torch.save({
+                        'encoder': encoder.state_dict(),
+                        'hypernet': hypernet.state_dict(),
+                    }, f"{checkpoint_dir}/phase1_epoch_{epoch_idx+1}.pth")
+
+        print("Phase 1 Complete. Latent Space Learned.")
+    
     # ==========================================================================
-    
-    print(f"\n=== Starting Phase 1: Representation Learning ({phase1_epochs} Epochs) ===")
-    
-    optimizer_p1 = torch.optim.AdamW(
-        list(encoder.parameters()) + list(hypernet.parameters()), 
-        lr=3e-4, weight_decay=1e-6
-    )
-    lr_scheduler_p1 = get_scheduler(
-        'cosine', optimizer=optimizer_p1, 
-        num_warmup_steps=500, num_training_steps=len(dataloader)*phase1_epochs
-    )
-    
-    with tqdm(range(phase1_epochs), desc='Phase 1 Epoch') as tglobal:
-        for epoch_idx in tglobal:
-            epoch_loss = []
-            for nbatch in tqdm(dataloader, desc='Batch', leave=False):
-                # Data
-                nstate = nbatch['state'].to(device)
-                naction = nbatch['action'].to(device)
-                B, _, _ = nstate.shape
-
-                # Forward
-                # 1. Variational Encoding
-                mu, logvar = encoder(nstate, naction)
-                
-                # 2. Reparameterize (Sample z)
-                z = encoder.reparameterize(mu, logvar)
-                
-                # 3. Decode (Hypernet -> Policy -> Action)
-                weights = hypernet(z)
-                pred_action = FunctionalPolicy.apply(nstate, weights)
-
-                # --- ELBO LOSS CALCULATION ---
-                # A. Reconstruction Loss (Likelihood)
-                # recon_loss = F.mse_loss(pred_action, naction)
-                recon_loss = F.mse_loss(pred_action, naction, reduction='sum') / B
-
-                # B. KL Divergence Loss
-                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                kl_loss = kl_loss / B
-
-                # Total Loss (Negative ELBO)
-                loss = recon_loss + (kl_weight * kl_loss)
-
-                # --- Optimization ---
-                optimizer_p1.zero_grad()
-                loss.backward()
-                optimizer_p1.step()
-                lr_scheduler_p1.step()
-
-                epoch_loss.append(loss.item())
-            
-            avg_loss = np.mean(epoch_loss)
-            tglobal.set_postfix(recon_loss=avg_loss)
-            
-            # Save Phase 1 Checkpoint
-            if (epoch_idx + 1) % 50 == 0:
-                torch.save({
-                    'encoder': encoder.state_dict(),
-                    'hypernet': hypernet.state_dict(),
-                }, f"{checkpoint_dir}/phase1_epoch_{epoch_idx+1}.pth")
-
-    print("Phase 1 Complete. Latent Space Learned.")
-    
-# ==========================================================================
     # TRANSITION: FREEZE REPRESENTATION
     # ==========================================================================
     
@@ -281,33 +312,17 @@ def main(dataset_path,checkpoint_dir):
 
             # Save Phase 2 Checkpoint
             if (epoch_idx + 1) % 100 == 0:
-                # # 1. Create a copy of the model with EMA weights applied
-                # # We don't want to overwrite the training model, so we copy the weights temporarily
-                # # ema.store(noise_pred_net.parameters()) # Save original weights
-                # ema.store(noise_pred_net)           # Save original weights
-
-                # # ema.copy_to(noise_pred_net.parameters()) # Load EMA weights into model
-                # ema.copy_to(noise_pred_net)         # Load EMA weights
-
-                # # Get the state_dict of the EMA-averaged model
-                # ema_model_state_dict = noise_pred_net.state_dict()
-                
-                # # Restore original weights to continue training correctly
-                # # ema.restore(noise_pred_net.parameters())
-                # ema.restore(noise_pred_net)         # Restore original weights
-
-
+                # 3. Save the checkpoint
                 torch.save({
                     'epoch': epoch_idx + 1,
-                    'diffusion_model': noise_pred_net.state_dict(), # The current training weights
-                    # 'ema_model': ema.model.state_dict(),              # The smoothed EMA weights
+                    'diffusion_model': ema.averaged_model.state_dict(),
                     'encoder': encoder.state_dict(),
                     'hypernet': hypernet.state_dict(),
                     'stats': dataset.stats
                 }, f"{checkpoint_dir}/phase2_epoch_{epoch_idx+1}.pth")
+                
 
     print("Training Complete. Model Ready for Inference.")
-
 
 if __name__ == '__main__':
     main()

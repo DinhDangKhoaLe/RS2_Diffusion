@@ -54,15 +54,15 @@ def main(checkpoint_path, num_videos, video_folder):
     
     # --- 2. Initialize Models ---
     # The Diffusion Model (Generates Latent Z)
-    # noise_pred_net = LatentUnet1D(
-    #     latent_dim=latent_dim,
-    #     global_cond_dim=global_cond_dim, # Condition on history
-    # ).to(device)
-
-    noise_pred_net = LatentDiffusionUNet(
-        input_dim=latent_dim,
-        cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    noise_pred_net = LatentUnet1D(
+        latent_dim=latent_dim,
+        global_cond_dim=global_cond_dim, # Condition on history
     ).to(device)
+
+    # noise_pred_net = LatentDiffusionUNet(
+    #     input_dim=latent_dim,
+    #     cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    # ).to(device)
     
     # The HyperNetwork (Decodes Z -> Policy Weights)
     hypernet = HyperNetwork(latent_dim, policy_shapes).to(device)
@@ -91,9 +91,11 @@ def main(checkpoint_path, num_videos, video_folder):
     max_steps = 500
     env = PushTEnv()
     number_success_video = 0
+    seed = 200
     
     for video_idx in range(num_videos):
-        seed = np.random.randint(201, 100000)
+        # seed = np.random.randint(201, 100000)
+        seed = seed +1
         env.seed(seed)
         obs, info = env.reset() # (obs_dim,)
 
@@ -132,9 +134,9 @@ def main(checkpoint_path, num_videos, video_folder):
                     t_sched = k
 
                     noise_pred = noise_pred_net(
-                        x=latent_z,
-                        timesteps=t_model,
-                        context=obs_cond
+                        sample=latent_z,
+                        timestep=t_model,
+                        global_cond=obs_cond
                     )
 
                     latent_z = noise_scheduler.step(
