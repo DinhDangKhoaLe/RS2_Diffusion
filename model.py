@@ -451,246 +451,106 @@ class TrajectoryEncoder(nn.Module):
             return mu + eps * std
         return mu
 
-        
-class ResnetBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels=None, time_emb_dim=None):
-        super().__init__()
-        self.out_channels = out_channels or in_channels
-        
-        self.norm1 = nn.GroupNorm(8, in_channels)
-        self.conv1 = nn.Conv1d(in_channels, self.out_channels, 3, padding=1)
-        
-        if time_emb_dim is not None:
-            self.time_emb_proj = nn.Linear(time_emb_dim, self.out_channels)
-            
-        self.norm2 = nn.GroupNorm(8, self.out_channels)
-        self.conv2 = nn.Conv1d(self.out_channels, self.out_channels, 3, padding=1)
-        
-        if in_channels != self.out_channels:
-            self.shortcut = nn.Conv1d(in_channels, self.out_channels, 1)
-        else:
-            self.shortcut = nn.Identity()
-
-    def forward(self, x, time_emb):
-        h = self.conv1(F.silu(self.norm1(x)))
-        
-        if time_emb is not None:
-            # Project time_emb and broadcast over sequence length
-            t_emb = self.time_emb_proj(F.silu(time_emb))
-            h = h + t_emb[:, :, None]
-            
-        h = self.conv2(F.silu(self.norm2(h)))
-        return h + self.shortcut(x)
-
-class TransformerBlock1D(nn.Module):
-    """
-    A Transformer block for 1D sequences with Cross-Attention.
-    Correctly handles cases where cond_dim != model_channels.
-    """
-    def __init__(self, dim, n_heads, cond_dim, depth=1):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                # 1. Self-Attention (Processing the Latent)
-                # Inputs: x, x, x (All have dimension 'dim')
-                nn.LayerNorm(dim),
-                nn.MultiheadAttention(embed_dim=dim, num_heads=n_heads, batch_first=True),
-                
-                # 2. Cross-Attention (Injecting the Condition)
-                # Query: x (dimension 'dim')
-                # Key/Value: context (dimension 'cond_dim')
-                # We must specify kdim and vdim!
-                nn.LayerNorm(dim),
-                nn.MultiheadAttention(
-                    embed_dim=dim, 
-                    num_heads=n_heads, 
-                    batch_first=True,
-                    kdim=cond_dim,   # <--- FIX: Tell layer Key dim is cond_dim
-                    vdim=cond_dim    # <--- FIX: Tell layer Value dim is cond_dim
-                ),
-                
-                # 3. Feed Forward
-                nn.LayerNorm(dim),
-                nn.Sequential(
-                    nn.Linear(dim, dim * 4),
-                    nn.GELU(),
-                    nn.Linear(dim * 4, dim)
-                )
-            ]))
-
-    def forward(self, x, context):
-        b, c, t = x.shape
-        x_in = x.permute(0, 2, 1) # (B, T, C)
-        
-        # Ensure context has a sequence dimension for attention
-        if context.ndim == 2:
-            context = context.unsqueeze(1) # (B, 1, cond_dim)
-
-        for ln_1, self_attn, ln_2, cross_attn, ln_3, ff in self.layers:
-            # 1. Self Attention
-            norm_x = ln_1(x_in)
-            attn_out, _ = self_attn(norm_x, norm_x, norm_x)
-            x_in = x_in + attn_out
-            
-            # 2. Cross Attention
-            norm_x = ln_2(x_in)
-            # Query=norm_x (dim=32), Key/Val=context (dim=10)
-            # The layer now handles the projection from 10 -> 32 internally
-            attn_out, _ = cross_attn(norm_x, context, context)
-            x_in = x_in + attn_out
-            
-            # 3. Feed Forward
-            out = ff(ln_3(x_in))
-            x_in = x_in + out
-            
-        return x_in.permute(0, 2, 1)
-
-class LatentDiffusionUNet(nn.Module):
-    def __init__(self,
-        input_dim,          # Dimension of the latent vector 'z' (e.g., 256)
-        cond_dim=4,         # "Conditioning Dimension 4"
-        model_channels=32,  # "Channels 32"
-        channel_mults=(1, 2, 4), # "Channel Multipliers {1, 2, 4}"
-        attn_levels=(0, 1), # "Attention Levels {0, 1}"
-        n_res_blocks=1,     # "Number of Residual Blocks 1"
-        n_heads=2,          # "Number of Heads 2"
-        tf_layers=1,        # "Transformer Layers 1"
+class ActionDecoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim,
+        state_dim,
+        action_dim,
+        pred_horizon,
+        tcn_hidden=256,
+        tcn_layers=4,
+        kernel_size=3,
     ):
         super().__init__()
-        
-        # 1. Input Processing
-        # We treat the input latent vector (B, input_dim) as a sequence (B, 1, input_dim)
-        # or (B, input_dim, 1). To use 1D Conv properly, we map:
-        # Input: (B, input_dim) -> Treat as (B, 1, input_dim) sequence
-        # Channels = 1 (feature channel), Length = input_dim.
-        
-        self.input_dim = input_dim
-        self.model_channels = model_channels
-        
-        # Time Embeddings
-        time_embed_dim = model_channels * 4
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(model_channels),
-            nn.Linear(model_channels, time_embed_dim),
-            nn.GELU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
+
+        self.pred_horizon = pred_horizon
+        self.tcn_hidden = tcn_hidden
+
+        # Latent expansion
+        self.latent_mlp = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, tcn_hidden * pred_horizon),
         )
 
-        # Initial Conv
-        self.input_conv = nn.Conv1d(1, model_channels, 3, padding=1)
+        # First layer must accept (latent_hidden + state_dim)
+        layers = []
 
-        # Downsampling Stack
-        self.down_blocks = nn.ModuleList([])
-        ch = model_channels
-        dims = [model_channels]
-        
-        curr_res = 1 # We track "resolution" logic as levels
-        
-        for i, mult in enumerate(channel_mults):
-            out_ch = model_channels * mult
-            for _ in range(n_res_blocks):
-                layers = [ResnetBlock1D(ch, out_ch, time_embed_dim)]
-                ch = out_ch
-                
-                # Check if we add Attention at this level
-                if i in attn_levels:
-                    layers.append(TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers))
-                
-                self.down_blocks.append(nn.ModuleList(layers))
-                dims.append(ch)
-            
-            # Downsample (except last level)
-            if i != len(channel_mults) - 1:
-                self.down_blocks.append(nn.ModuleList([Downsample1d(ch)]))
-                dims.append(ch)
+        # First conditional block
+        layers.append(
+            TemporalBlock(
+                tcn_hidden + state_dim,
+                tcn_hidden,
+                kernel_size=kernel_size,
+                dilation=1,
+            )
+        )
 
-        # Middle Block
-        self.mid_block1 = ResnetBlock1D(ch, ch, time_embed_dim)
-        self.mid_attn = TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers)
-        self.mid_block2 = ResnetBlock1D(ch, ch, time_embed_dim)
+        # Remaining dilated blocks
+        for i in range(1, tcn_layers):
+            dilation = 2 ** i
+            layers.append(
+                TemporalBlock(
+                    tcn_hidden,
+                    tcn_hidden,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                )
+            )
 
-        # Upsampling Stack
-        self.up_blocks = nn.ModuleList([])
-        
-        # Reverse the multipliers for upsampling
-        for i, mult in enumerate(reversed(channel_mults)):
-            out_ch = model_channels * mult
-            # Map the reversed index i back to the original level index for attention check
-            original_level_idx = len(channel_mults) - 1 - i
-            
-            for _ in range(n_res_blocks + 1): # +1 for the skip connection
-                layers = [ResnetBlock1D(ch + dims.pop(), out_ch, time_embed_dim)]
-                ch = out_ch
-                
-                if original_level_idx in attn_levels:
-                    layers.append(TransformerBlock1D(ch, n_heads, cond_dim, depth=tf_layers))
-                
-                self.up_blocks.append(nn.ModuleList(layers))
-            
-            if original_level_idx != 0:
-                self.up_blocks.append(Upsample1d(ch))
+        self.tcn = nn.Sequential(*layers)
 
-        # Final Output
-        self.out_norm = nn.GroupNorm(8, ch)
-        self.out_conv = nn.Conv1d(ch, 1, 3, padding=1)
+        self.output_proj = nn.Conv1d(tcn_hidden, action_dim, 1)
 
-    def forward(self, x, timesteps, context):
+
+    def forward(self, z, states):
         """
-        x: (B, input_dim) -> Noisy Latent
-        timesteps: (B,) -> Noise levels
-        context: (B, cond_dim) -> Conditioning vector
+        z:      (B, latent_dim)
+        states: (B, T, state_dim)
         """
-        # Shape Handling: (B, D) -> (B, 1, D)
-        # 1 Channel, Length = D
-        x = x.unsqueeze(1) 
-        
-        t = self.time_mlp(timesteps)
-        
-        h = self.input_conv(x)
-        hs = [h]
-        
-        # --- Down ---
-        for module in self.down_blocks:
-            if isinstance(module, nn.ModuleList): # ResNet + Attn
-                for layer in module:
-                    if isinstance(layer, ResnetBlock1D):
-                        h = layer(h, t)
-                    elif isinstance(layer, TransformerBlock1D):
-                        h = layer(h, context)
-                hs.append(h)
-            else: # Downsample
-                h = module(h)
-                hs.append(h)
 
-        # --- Mid ---
-        h = self.mid_block1(h, t)
-        h = self.mid_attn(h, context)
-        h = self.mid_block2(h, t)
+        B = z.size(0)
 
-        # --- Up ---
-        for module in self.up_blocks:
-            if isinstance(module, nn.ModuleList): # ResNet + Attn
-                # Concatenate Skip Connection
-                h_skip = hs.pop()
-                # Ensure shapes match (handle potential odd/even rounding issues if input_dim is weird)
-                if h.shape[-1] != h_skip.shape[-1]:
-                    h = F.interpolate(h, size=h_skip.shape[-1], mode='nearest')
-                    
-                h = torch.cat((h, h_skip), dim=1)
-                
-                for layer in module:
-                    if isinstance(layer, ResnetBlock1D):
-                        h = layer(h, t)
-                    elif isinstance(layer, TransformerBlock1D):
-                        h = layer(h, context)
-            else: # Upsample
-                h = module(h)
+        # Expand latent
+        h = self.latent_mlp(z)
+        h = h.view(B, self.tcn_hidden, self.pred_horizon)
 
-        h = self.out_conv(F.silu(self.out_norm(h)))
-        
-        # Shape Back: (B, 1, D) -> (B, D)
-        return h.squeeze(1)
+        # Prepare states
+        states = states.transpose(1, 2)  # (B, state_dim, T)
+
+        # Concatenate conditioning
+        h = torch.cat([h, states], dim=1)
+
+        # Temporal decoding
+        h = self.tcn(h)
+
+        actions = self.output_proj(h)
+
+        return actions.transpose(1, 2)
+ 
+class ActionVAE(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def forward(self, states, actions):
+        mu, logvar = self.encoder(states, actions)
+        z = self.reparameterize(mu, logvar)
+        recon_actions = self.decoder(z, states)
+        return recon_actions, mu, logvar
+
+    def encode(self, states, actions):
+        mu, logvar = self.encoder(states, actions)
+        return self.reparameterize(mu, logvar)
  
 class LatentUnet1D(nn.Module):
     """
@@ -849,23 +709,6 @@ class HyperNetwork(nn.Module):
             key: torch.stack(p, dim=0)
             for key, p in zip(self.keys_list, params)
         }
-        
-    # def forward(self, z):
-    #     """
-    #     Args:
-    #         z: (B, latent_dim)
-    #     Returns:
-    #         params_dict: dict of tensors with shape (B, *param_shape)
-    #     """
-    #     # HMLP returns a list of tensors: [tensor(B, shape1), tensor(B, shape2), ...]
-    #     params = self.hnet(cond_input=z)
-        
-    #     # Ensure params is a list of tensors, not a list of lists
-    #     # If HMLP returns a list of lists, this dictionary comprehension 
-    #     # should be optimized using torch.cat or similar batch operations.
-    #     return {
-    #         key: p for key, p in zip(self.keys_list, params)
-    #     }
 
 class FunctionalPolicy:
     @staticmethod

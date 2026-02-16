@@ -15,9 +15,9 @@ from model import (
 ConditionalUnet1D,
 FunctionalPolicy,
 TrajectoryEncoder,
-LatentUnet1D,
 HyperNetwork,
-LatentDiffusionUNet
+ActionVAE,
+ActionDecoder
 )
 from dataset_pusht_state import PushTStateDataset
 from vision_encoder import get_resnet, replace_bn_with_gn
@@ -59,7 +59,7 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     # create dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=128,
+        batch_size=512,
         num_workers=8,
         shuffle=True,
         # accelerate cpu-gpu transfer
@@ -100,6 +100,8 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     
     # 1. Encoder (Trainable): Action -> z
     encoder = TrajectoryEncoder(state_dim, action_dim, pred_horizon, latent_dim).to(device)
+    decoder = ActionDecoder(latent_dim,state_dim, action_dim, pred_horizon).to(device)
+    vae = ActionVAE(encoder, decoder).to(device)
     
     # 2. Diffusion Model (Trainable): Noisy z -> Noise
     
@@ -168,22 +170,22 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                     nstate = nbatch['state'].to(device)
                     naction = nbatch['action'].to(device)
                     B, _, _ = nstate.shape
+                    
+                    #### VAE
+                    pred_action, mu, logvar = vae(nstate, naction)
 
-                    # Forward
+                    #### LWD
                     # 1. Variational Encoding
-                    mu, logvar = encoder(nstate, naction)
-                    
-                    # 2. Reparameterize (Sample z)
-                    z = encoder.reparameterize(mu, logvar)
-                    
-                    # 3. Decode (Hypernet -> Policy -> Action)
-                    weights = hypernet(z)
-                    pred_action = FunctionalPolicy.apply(nstate, weights)
+                    # mu, logvar = encoder(nstate, naction)
+                    # z = encoder.reparameterize(mu, logvar)
+                    # weights = hypernet(z)
+                    # pred_action = FunctionalPolicy.apply(nstate, weights)
 
                     # --- ELBO LOSS CALCULATION ---
                     # A. Reconstruction Loss (Likelihood)
                     # recon_loss = F.mse_loss(pred_action, naction)
                     recon_loss = F.mse_loss(pred_action, naction, reduction='sum') / B
+                    # recon_loss = F.mse_loss(recon, x_out)
 
                     # B. KL Divergence Loss
                     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -264,9 +266,13 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                 # --- 1. Get Ground Truth 'z' (Latent Skill) ---
                 # We use the frozen Encoder to extract the "Perfect Skill" for this trajectory.
                 with torch.no_grad():
-                    # CRITICAL UPDATE: Pass both State and Action to encoder
-                    mu, logvar = encoder(nstate, naction)
-                    z_gt = encoder.reparameterize(mu, logvar)
+                    ### LWD
+                    # mu, logvar = encoder(nstate, naction)
+                    # z_gt = encoder.reparameterize(mu, logvar)
+                    
+                    ### VAE
+                    z_gt = vae.encode(nstate, naction)
+                    
                     z_gt = z_gt.unsqueeze(-1)
                     
                 # --- 2. Diffusion Forward Process ---
