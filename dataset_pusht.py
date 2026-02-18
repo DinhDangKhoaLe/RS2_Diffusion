@@ -85,7 +85,15 @@ class PushTImageDataset(torch.utils.data.Dataset):
         # float32, [0,1], (N,96,96,3)
         train_image_data = dataset_root['data']['img'][:]
         train_image_data = np.moveaxis(train_image_data, -1,1)
-        # (N,3,96,96)
+        # (N,3,224,224)
+        
+        if train_image_data.shape[-1] != 96:
+            import torch.nn.functional as F
+            # Convert to torch temporarily to use fast interpolators
+            tmp_tensor = torch.from_numpy(train_image_data).float()
+            # Resize to 96x96
+            tmp_tensor = F.interpolate(tmp_tensor, size=(96, 96), mode='bilinear', align_corners=False)
+            train_image_data = tmp_tensor.numpy()
 
         # (N, D)
         train_data = {
@@ -139,6 +147,6 @@ class PushTImageDataset(torch.utils.data.Dataset):
         )
 
         # discard unused observations
-        nsample['image'] = nsample['image'][:self.obs_horizon,:]
-        nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon,:]
+        # nsample['image'] = nsample['image'][:self.obs_horizon,:]
+        # nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon,:]
         return nsample

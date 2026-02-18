@@ -681,6 +681,7 @@ class HyperNetwork(nn.Module):
         self.param_shapes = param_shapes
         self.keys_list = list(param_shapes.keys())
         self.shapes_list = list(param_shapes.values())
+        self.input_norm = nn.LayerNorm(latent_dim)
         
         # Initialize HMLP
         self.hnet = HMLP(
@@ -696,6 +697,7 @@ class HyperNetwork(nn.Module):
         Returns:
             params_dict: dict[str, Tensor] with shape (B, *param_shape)
         """
+        z = self.input_norm(z)
         params = self.hnet(cond_input=z)
 
         # Normalize to batch-first list

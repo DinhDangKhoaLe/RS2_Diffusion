@@ -20,6 +20,8 @@ ActionVAE,
 ActionDecoder
 )
 from dataset_pusht_state import PushTStateDataset
+# from dataset_pusht import PushTImageDataset
+
 from vision_encoder import get_resnet, replace_bn_with_gn
 
 @click.command()
@@ -53,6 +55,14 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
         obs_horizon=obs_horizon,
         action_horizon=action_horizon
     )
+    
+    # dataset = PushTImageDataset(
+    #     dataset_path=dataset_path,
+    #     pred_horizon=pred_horizon,
+    #     obs_horizon=obs_horizon,
+    #     action_horizon=action_horizon
+    # )
+        
     # save training data statistics (min, max) for each dim
     stats = dataset.stats
 
@@ -74,11 +84,22 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     print("batch['state'].shape:", batch['state'].shape)
     print("batch['action'].shape", batch['action'].shape)
     
-    # --- Define Policy Architecture (Target for HyperNet) ---
-    # We want a policy that takes (Obs) and outputs (Action Trajectory)
-    # Input: obs_dim
-    # Output: action_dim
+    # print("batch['image'].shape:", batch['image'].shape)
+    # print("batch['agent_pos'].shape:", batch['agent_pos'].shape)
+    # print("batch['action'].shape", batch['action'].shape)
     
+    
+    #### Construct RESNET-18
+    # vision_encoder = get_resnet('resnet18')
+    # vision_encoder = replace_bn_with_gn(vision_encoder).to(device)
+    # vision_feature_dim = 256
+    # lowdim_obs_dim = 2
+    # state_dim = vision_feature_dim + lowdim_obs_dim
+    # action_dim = 2
+    # latent_dim = 256  # Size of 'z'
+    # hidden_dim = 256 # 256 neurons per layer
+    
+    #### Construct STATE only
     obs_dim = 5
     state_dim = 5
     action_dim = 2
@@ -107,7 +128,7 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
     
     noise_pred_net = ConditionalUnet1D(
         input_dim=1,
-        global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
+        global_cond_dim=state_dim*obs_horizon, # Condition on Obs
     ).to(device)
     
     # 3. HyperNetwork (Trainable): z -> Weights
@@ -154,6 +175,12 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
             lr=3e-4,
             weight_decay=1e-6
         )
+        
+        # optimizer_p1 = torch.optim.AdamW(
+        #     list(vision_encoder.parameters()) + list(encoder.parameters()) + list(hypernet.parameters()),
+        #     lr=3e-4,
+        #     weight_decay=1e-6
+        # )
 
         lr_scheduler_p1 = get_scheduler(
             'cosine',
@@ -168,8 +195,15 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                 for nbatch in tqdm(dataloader, desc='Batch', leave=False):
                     # Data
                     nstate = nbatch['state'].to(device)
+                    # nimage = nbatch['image'].to(device, dtype=torch.float32)
+                    # nagent_pos = nbatch['agent_pos'].to(device)
                     naction = nbatch['action'].to(device)
-                    B, _, _ = nstate.shape
+                    B = naction.shape[0]
+                    
+                    # Encode Image
+                    # image_features = vision_encoder(nimage.flatten(end_dim=1))
+                    # image_features = image_features.reshape(*nimage.shape[:2],-1)
+                    # nstate = torch.cat([image_features, nagent_pos], dim=-1)
                     
                     #### VAE
                     # pred_action, mu, logvar = vae(nstate, naction)
@@ -254,24 +288,29 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
             
             for nbatch in tqdm(dataloader, desc='Batch', leave=False):
                 # Data
-                nobs = nbatch['obs'].to(device)
                 nstate = nbatch['state'].to(device)
+                # nimage = nbatch['image'].to(device, dtype=torch.float32)
+                # nagent_pos = nbatch['agent_pos'].to(device)
                 naction = nbatch['action'].to(device)
-                B = nobs.shape[0]
+                B = naction.shape[0]
                 
+                # image_features = vision_encoder(nimage.flatten(end_dim=1))
+                # image_features = image_features.reshape(*nimage.shape[:2],-1)
+                # nstate = torch.cat([image_features, nagent_pos], dim=-1)
+                    
                 # Conditioning Context: The starting observation(s)
                 # Flatten (B, Obs_Horizon, Dim) -> (B, Obs_Horizon * Dim)
-                obs_cond = nobs[:,:obs_horizon,:].flatten(start_dim=1)
+                obs_cond = nstate[:,:obs_horizon,:].flatten(start_dim=1)
 
                 # --- 1. Get Ground Truth 'z' (Latent Skill) ---
                 # We use the frozen Encoder to extract the "Perfect Skill" for this trajectory.
                 with torch.no_grad():
                     ### LWD
-                    # mu, logvar = encoder(nstate, naction)
-                    # z_gt = encoder.reparameterize(mu, logvar)
+                    mu, logvar = encoder(nstate, naction)
+                    z_gt = encoder.reparameterize(mu, logvar)
                     
                     ### VAE
-                    z_gt = vae.encode(nstate, naction)
+                    # z_gt = vae.encode(nstate, naction)
                     
                     z_gt = z_gt.unsqueeze(-1)
                     
@@ -316,7 +355,7 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                     'diffusion_model': ema.averaged_model.state_dict(),
                     'encoder': encoder.state_dict(),
                     'hypernet': hypernet.state_dict(),
-                    'stats': dataset.stats
+                    'stats': stats
                 }, f"{checkpoint_dir}/phase2_epoch_{epoch_idx+1}.pth")
                 
 
