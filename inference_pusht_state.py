@@ -12,7 +12,7 @@ from skvideo.io import vwrite
 # Import your modules
 # Ensure these files are in the same directory or python path
 from envir_pusht import PushTEnv
-from model import FunctionalPolicy, LatentUnet1D, HyperNetwork, LatentDiffusionUNet
+from model import FunctionalPolicy, LatentUnet1D, HyperNetwork, ConditionalUnet1D
 from dataset_pusht import normalize_data, unnormalize_data
 
 @click.command()
@@ -54,15 +54,15 @@ def main(checkpoint_path, num_videos, video_folder):
     
     # --- 2. Initialize Models ---
     # The Diffusion Model (Generates Latent Z)
-    noise_pred_net = LatentUnet1D(
-        latent_dim=latent_dim,
-        global_cond_dim=global_cond_dim, # Condition on history
-    ).to(device)
-
-    # noise_pred_net = LatentDiffusionUNet(
-    #     input_dim=latent_dim,
-    #     cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    # noise_pred_net = LatentUnet1D(
+    #     latent_dim=latent_dim,
+    #     global_cond_dim=global_cond_dim, # Condition on history
     # ).to(device)
+
+    noise_pred_net = ConditionalUnet1D(
+        input_dim=1,
+        global_cond_dim=obs_dim*obs_horizon, # Condition on Obs
+    ).to(device)
     
     # The HyperNetwork (Decodes Z -> Policy Weights)
     hypernet = HyperNetwork(latent_dim, policy_shapes).to(device)
@@ -122,7 +122,7 @@ def main(checkpoint_path, num_videos, video_folder):
             # B. Generate Policy Weights (The "Skill")
             with torch.no_grad():    
                 # 1. Sample Noise
-                latent_z = torch.randn((1, latent_dim), device=device)
+                latent_z = torch.randn((1, latent_dim, 1), device=device)
                 
                 # 2. Diffusion Denoising
                 noise_scheduler.set_timesteps(num_diffusion_iters)
@@ -145,6 +145,7 @@ def main(checkpoint_path, num_videos, video_folder):
                         sample=latent_z
                     ).prev_sample
                 
+                latent_z = latent_z.squeeze(-1)
                 # 3. Decode Z -> Weights
                 weights = hypernet(latent_z)
             

@@ -172,14 +172,14 @@ def main(dataset_path,checkpoint_dir, phase1_ckpt):
                     B, _, _ = nstate.shape
                     
                     #### VAE
-                    pred_action, mu, logvar = vae(nstate, naction)
+                    # pred_action, mu, logvar = vae(nstate, naction)
 
                     #### LWD
                     # 1. Variational Encoding
-                    # mu, logvar = encoder(nstate, naction)
-                    # z = encoder.reparameterize(mu, logvar)
-                    # weights = hypernet(z)
-                    # pred_action = FunctionalPolicy.apply(nstate, weights)
+                    mu, logvar = encoder(nstate, naction)
+                    z = encoder.reparameterize(mu, logvar)
+                    weights = hypernet(z)
+                    pred_action = FunctionalPolicy.apply(nstate, weights)
 
                     # --- ELBO LOSS CALCULATION ---
                     # A. Reconstruction Loss (Likelihood)

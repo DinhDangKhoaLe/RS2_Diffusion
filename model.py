@@ -745,5 +745,5 @@ class FunctionalPolicy:
         b3 = params_dict['fc3.bias']
         x = torch.einsum(einsum_str, x, w3) + bias_op(b3)
         
-        # return torch.tanh(x)
-        return x
+        return torch.tanh(x)
+        # return x
