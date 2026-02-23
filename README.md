@@ -21,7 +21,7 @@ When installing Manbaforge, remember to choose the option that adds the executab
 
 Clone the RS2_Diffusion package.
 ```console
-(base)$ git clone https://github.com/DinhDangKhoaLe/RS2_Diffusion.git
+(base)$ git clone https://github.com/DinhDangKhoaLe/RS2_Diffusion.git && cd RS2_Diffusion
 ```
 Use the following command to create a virtual environment named "RS2Diffusion" and install all the required packages.
 
@@ -39,7 +39,8 @@ For using pre-trained model:
 Download the pre-train model. This model was trained using 200 demonstrations over 200 epochs.
 
 ```console
-(RS2diffusion)$ mkdir -p ckpt/image && cd ckpt && gdown 1sJOWmka15V7nL71jXH9Qs31aAw2zF9Bm && cd ..
+(RS2diffusion)$ mkdir -p ckpt/image && cd ckpt/image && gdown 1sJOWmka15V7nL71jXH9Qs31aAw2zF9Bm && cd ../../
+
 (RS2diffusion)$ python3 inference_pusht.py -i ckpt/image/pusht_checkpoint_final.pth
 ```
 Note: When the simulation finishes, it will generate 10 MP4 files (by default) in the "videos" folder for evaluation. The evaluation data will not be the same as the training data.
