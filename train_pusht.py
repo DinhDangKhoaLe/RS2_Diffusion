@@ -15,7 +15,7 @@ from vision_encoder import get_resnet, replace_bn_with_gn
 
 @click.command()
 @click.option('-i', '--dataset_path', required=True)
-@click.option('-o', '--checkpoint_dir', default='ckpt', help='Directory to save checkpoints')
+@click.option('-o', '--checkpoint_dir', default='ckpt/image', help='Directory to save checkpoints')
 def main(dataset_path,checkpoint_dir):
     # Ensure checkpoint directory exists
     if not os.path.exists(checkpoint_dir):
@@ -23,6 +23,8 @@ def main(dataset_path,checkpoint_dir):
     # Ensure dataset path exists
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
+
+    device = torch.device('cuda')
 
     # parameters
     pred_horizon = 16
@@ -135,13 +137,12 @@ def main(dataset_path,checkpoint_dir):
     )
 
     # device transfer
-    device = torch.device('cuda')
     _ = nets.to(device)
 
     num_epochs = 200
 
     ema = EMAModel(
-        parameters=nets['noise_pred_net'].parameters(),
+        parameters=nets.parameters(),
         power=0.75)
 
     optimizer = torch.optim.AdamW(
@@ -170,8 +171,7 @@ def main(dataset_path,checkpoint_dir):
                 for nbatch in tepoch:
                     # data normalized in dataset
                     # device transfer
-                    nimage = nbatch['image'][:,:obs_horizon].to(device)
-                    nimage = torch.tensor(nimage, dtype=torch.float32, device='cuda') # convert to float 32
+                    nimage = nbatch['image'][:,:obs_horizon].to(device, dtype=torch.float32)
                     nagent_pos = nbatch['agent_pos'][:,:obs_horizon].to(device)
                     naction = nbatch['action'].to(device)
                     B = nagent_pos.shape[0]
@@ -217,8 +217,7 @@ def main(dataset_path,checkpoint_dir):
 
                     # update Exponential Moving Average of the model weights
                     # ema.step(nets.parameters())
-                    ema.step(nets['noise_pred_net'].parameters())
-
+                    ema.step(nets.parameters())
 
                     # logging
                     loss_cpu = loss.item()

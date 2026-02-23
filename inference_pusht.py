@@ -53,7 +53,7 @@ def main(checkpoint_path, num_videos, video_folder):
     # Move models to GPU
     ema_nets = ema_nets.to(device)
     # Load the checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     ema_nets.load_state_dict(checkpoint['model_state_dict'])
     stats = checkpoint['stats']
     

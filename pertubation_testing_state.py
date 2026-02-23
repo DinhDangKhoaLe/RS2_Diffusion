@@ -39,15 +39,12 @@ def main(checkpoint_path, num_videos, video_folder):
     action_dim = 2
     obs_dim = 5
     
-    vision_encoder = get_resnet('resnet18')
-    vision_encoder = replace_bn_with_gn(vision_encoder)
     # create network object
     noise_pred_net = ConditionalUnet1D(
         input_dim=action_dim,
         global_cond_dim=obs_dim*obs_horizon
-    )
-    # Move models to GPU
-    noise_pred_net = noise_pred_net.to(device)
+    ).to(device)
+
     # Load the checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     noise_pred_net.load_state_dict(checkpoint['model_state_dict'])
