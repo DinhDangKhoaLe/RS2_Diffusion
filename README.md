@@ -21,17 +21,17 @@ When installing Manbaforge, remember to choose the option that adds the executab
 
 Clone the RS2_Diffusion package.
 ```console
-(base)$ git clone https://github.com/DinhDangKhoaLe/RS2_Diffusion.git && cd RS2_Diffusion
+git clone https://github.com/DinhDangKhoaLe/RS2_Diffusion.git && cd RS2_Diffusion
 ```
 Use the following command to create a virtual environment named "RS2Diffusion" and install all the required packages.
 
 ```console
-(base)$ conda env create -f conda_environment.yaml
+conda env create -f conda_environment.yaml
 ```
 Activate the environment. After running this command, the active environment will change from "base" to "RS2Diffusion".
 
 ```console
-(base)$ conda activate RS2diffusion
+conda activate RS2diffusion
 ```
 ## Inference
 For using pre-trained model:
@@ -39,21 +39,21 @@ For using pre-trained model:
 Download the pre-train model. This model was trained using 200 demonstrations over 200 epochs.
 
 ```console
-(RS2diffusion)$ mkdir -p ckpt/image && cd ckpt/image && gdown 1sJOWmka15V7nL71jXH9Qs31aAw2zF9Bm && cd ../../
+mkdir -p ckpt/image && cd ckpt/image && gdown 1sJOWmka15V7nL71jXH9Qs31aAw2zF9Bm && cd ../../
 
-(RS2diffusion)$ python3 inference_pusht.py -i ckpt/image/pusht_checkpoint_final.pth
+python3 inference_pusht.py -i ckpt/image/pusht_checkpoint_final.pth
 ```
 Note: When the simulation finishes, it will generate 10 MP4 files (by default) in the "videos" folder for evaluation. The evaluation data will not be the same as the training data.
 A run is considered a success if the model pushes the block to cover at least 90% of the goal within 300 steps. Each video filename will include either 'failed' or 'succeeded' to indicate the outcome
 
 If you want to generate more or less videos to evaluate:
 ```console
-(RS2diffusion)$ python3 inference_pusht.py -i ckpt/image/pusht_checkpoint_final.pth -n "number_videos"
+python3 inference_pusht.py -i ckpt/image/pusht_checkpoint_final.pth -n "number_videos"
 ```
 
 ## Pertubation testing
 ```console
-(RS2diffusion)$ python3 pertubation_testing.py -i ckpt/image/pusht_checkpoint_final.pth
+python3 pertubation_testing.py -i ckpt/image/pusht_checkpoint_final.pth
 ```
 Instruction for pertubating the T-block in the simulation: 
 
@@ -69,7 +69,7 @@ Instruction for pertubating the T-block in the simulation:
 ## Creating Training Data Set
 Run the data collection script:
 ```console
-(RS2diffusion)$ python3 collect_data_pusht.py -o data/pusht_data.zarr
+python3 collect_data_pusht.py -o data/pusht_data.zarr
 ```
 
 Instruction for collecting data in the simulation: 
@@ -89,7 +89,7 @@ NOTE: The dataset should contain approximately 200 demonstrations, which takes a
 If you want to skip the data collection step, download this dataset using the command below which already contains 200 collected demonstrations. You can also continue collecting more data on top of this by simply running the command mentioned above. Make sure the file name is correct.
 
 ```console
-(RS2diffusion)$ mkdir -p data && cd data && gdown 1QOSBEQxVVEW-EJTmPTpUmUckPUVraNTw && unzip pusht_data.zarr.zip && cd ..
+mkdir -p data && cd data && gdown 1QOSBEQxVVEW-EJTmPTpUmUckPUVraNTw && unzip pusht_data.zarr.zip && cd ..
 ```
 
 
@@ -100,7 +100,7 @@ A GPU with more than 8GB of VRAM is recommended.
 This code has been tested on NVIDIA RTX 3060 and 2080 Ti, where the training time is approximately 1 hour.
 
 ```console
-(RS2diffusion)$ python3 train_pusht.py -i data/pusht_data.zarr
+python3 train_pusht.py -i data/pusht_data.zarr
 ```
 
 The checkpoint will be saved every 20 epochs. You can then test your model using the command in the Inference section. Remember to update the path to point to the specific model checkpoint you want to evaluate.
@@ -109,6 +109,6 @@ The checkpoint will be saved every 20 epochs. You can then test your model using
 The state_based assumes the knowledge of the exact position and oritentation of the T-block which derived from the simulation. Therefore, the observation for this setup only has 5 dimension the 2D pose of the T-block + position of the agent. All the commands for training and inference are below. Pertubation testing for the state has not been setup yet. 
 
 ```console
-(RS2diffusion)$ python3 train_pusht_state.py -i data/pusht_data.zarr
-(RS2diffusion)$ python3 inference_pusht_state.py -i ckpt/state/pusht_checkpoint_final.pth
+python3 train_pusht_state.py -i data/pusht_data.zarr
+python3 inference_pusht_state.py -i ckpt/state/pusht_checkpoint_final.pth
 ```
